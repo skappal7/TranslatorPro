@@ -1,20 +1,3 @@
-#app.py — Streamlit Multilingual Transcript Translator & Keyword Pipeline
-Python: 3.11-compatible
-
-Features
-- Tabs: Upload → Translation → Keywords → Export
-- Upload TXT/CSV/XLSX, choose text columns for tabular files
-- Source language (or Auto), pivot language for keyword extraction, multiple target languages for keyword back-translation
-- Translation backends: deep-translator (Google) or Azure Translator (REST). Azure requires env vars
-- Keyword extraction: RAKE (nltk) or YAKE
-- Download artifacts at each step in TXT/CSV/XLSX
-- Caching and chunking for long texts; clear error messages
-
-Run
-  pip install -r requirements.txt
-  # (optional) set AZURE_TRANSLATOR_KEY, AZURE_TRANSLATOR_REGION, AZURE_TRANSLATOR_ENDPOINT
-  streamlit run app.py
-"""
 from __future__ import annotations
 import os
 import io
