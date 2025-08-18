@@ -1,11 +1,14 @@
 from __future__ import annotations
 import os
 import io
-from typing import List, Dict, Tuple
+import math
+import asyncio
+from typing import List, Dict, Tuple, Iterable
 
 import streamlit as st
 import pandas as pd
 import requests
+import httpx
 
 # --- Optional keyword extractors ---
 try:
@@ -103,17 +106,82 @@ def concat_text_from_df(df: pd.DataFrame, columns: List[str]) -> str:
 
 
 # ===============================================================
-# Translation backends
+# Chunking utilities
+# ===============================================================
+
+def chunk_text(text: str, max_chars: int = 1000) -> List[str]:
+    """Greedy whitespace-aware chunker that keeps chunks <= max_chars."""
+    if len(text) <= max_chars:
+        return [text]
+    chunks: List[str] = []
+    buf: List[str] = []
+    cur = 0
+    while cur < len(text):
+        end = min(len(text), cur + max_chars)
+        # try to break on last whitespace/newline within window
+        window = text[cur:end]
+        if end < len(text):
+            brk = window.rfind("\n")
+            if brk < 0:
+                brk = window.rfind(" ")
+            if brk > 200:  # avoid tiny fragments
+                end = cur + brk
+        chunk = text[cur:end]
+        chunks.append(chunk)
+        cur = end
+    return chunks
+
+
+def batched(iterable: Iterable, n: int) -> Iterable[List]:
+    batch: List = []
+    for item in iterable:
+        batch.append(item)
+        if len(batch) >= n:
+            yield batch
+            batch = []
+    if batch:
+        yield batch
+
+
+# ===============================================================
+# Translation backends (FAST)
 # ===============================================================
 @st.cache_data(show_spinner=False)
 def translate_text_deep_translator(text: str, source: str, target: str) -> str:
+    """Legacy single-call (kept for compatibility)."""
     from deep_translator import GoogleTranslator
     translator = GoogleTranslator(source=source, target=target)
     return _chunked_translate(lambda c: translator.translate(c), text)
 
 
-@st.cache_data(show_spinner=False)
-def translate_text_azure(text: str, source: str, target: str) -> str:
+def _chunked_translate(fn, text: str, max_len: int = 4500, overlap: int = 0) -> str:
+    if len(text) <= max_len:
+        return fn(text)
+    parts: List[str] = []
+    start = 0
+    while start < len(text):
+        end = min(len(text), start + max_len)
+        parts.append(fn(text[start:end]))
+        start = end - overlap
+        if start < 0:
+            start = end
+    return "".join(parts)
+
+
+async def _translate_chunks_deep_async(chunks: List[str], source: str, target: str, concurrency: int = 8) -> List[str]:
+    from deep_translator import GoogleTranslator
+    sem = asyncio.Semaphore(concurrency)
+    translator = GoogleTranslator(source=source, target=target)
+
+    async def run_one(txt: str) -> str:
+        async with sem:
+            # deep_translator is blocking; run in thread pool
+            return await asyncio.to_thread(translator.translate, txt)
+
+    return await asyncio.gather(*[run_one(c) for c in chunks])
+
+
+async def _translate_batches_azure_async(chunks: List[str], source: str, target: str, batch_size: int = 25, concurrency: int = 8) -> List[str]:
     key = os.getenv("AZURE_TRANSLATOR_KEY")
     region = os.getenv("AZURE_TRANSLATOR_REGION")
     endpoint = os.getenv("AZURE_TRANSLATOR_ENDPOINT", "https://api.cognitive.microsofttranslator.com")
@@ -132,27 +200,73 @@ def translate_text_azure(text: str, source: str, target: str) -> str:
         "Content-type": "application/json",
     }
 
-    def api_call(chunk: str) -> str:
-        resp = requests.post(url, headers=headers, json=[{"text": chunk}], timeout=60)
-        resp.raise_for_status()
-        data = resp.json()
-        return data[0]["translations"][0]["text"]
+    async def post_batch(client: httpx.AsyncClient, texts: List[str]) -> List[str]:
+        # simple retry loop
+        for attempt in range(4):
+            try:
+                resp = await client.post(url, headers=headers, json=[{"text": t} for t in texts], timeout=60)
+                resp.raise_for_status()
+                data = resp.json()
+                return [item["translations"][0]["text"] for item in data]
+            except Exception:
+                if attempt == 3:
+                    raise
+                await asyncio.sleep(1.5 * (attempt + 1))
+        return [""] * len(texts)
 
-    return _chunked_translate(api_call, text)
+    results: List[str] = [""] * len(chunks)
+    async with httpx.AsyncClient() as client:
+        sem = asyncio.Semaphore(concurrency)
+        tasks = []
+        index = 0
+        for batch in batched(chunks, batch_size):
+            bstart = index
+            bend = index + len(batch)
+            index = bend
+
+            async def run(b=batch, s=bstart, e=bend):
+                async with sem:
+                    outs = await post_batch(client, b)
+                    results[s:e] = outs
+            tasks.append(asyncio.create_task(run()))
+        await asyncio.gather(*tasks)
+    return results
 
 
-def _chunked_translate(fn, text: str, max_len: int = 4500, overlap: int = 0) -> str:
-    if len(text) <= max_len:
-        return fn(text)
-    parts: List[str] = []
-    start = 0
-    while start < len(text):
-        end = min(len(text), start + max_len)
-        parts.append(fn(text[start:end]))
-        start = end - overlap
-        if start < 0:
-            start = end
-    return "".join(parts)
+def translate_large_text(text: str, source: str, target: str, backend: str, max_chars: int, batch_size: int, concurrency: int, progress: st.delta_generator.DeltaGenerator) -> str:
+    """High-throughput translation orchestrator returning the combined string."""
+    chunks = chunk_text(text, max_chars=max_chars)
+    total = len(chunks)
+    if total == 0:
+        return ""
+
+    # Progress UI
+    bar = progress.progress(0, text="Preparing…")
+
+    async def run():
+        bar.progress(0, text=f"Translating {total} chunk(s)…")
+        if backend.startswith("Google"):
+            outs = await _translate_chunks_deep_async(chunks, source, target, concurrency=concurrency)
+        else:
+            outs = await _translate_batches_azure_async(chunks, source, target, batch_size=batch_size, concurrency=concurrency)
+        return outs
+
+    # Run event loop
+    outs: List[str] = asyncio.run(run())
+
+    # Update progress to 100%
+    bar.progress(100, text="Done")
+    return "".join(outs)
+
+
+async def translate_list_async(items: List[str], source: str, target: str, backend: str, concurrency: int = 8) -> List[str]:
+    if not items:
+        return []
+    if backend.startswith("Google"):
+        return await _translate_chunks_deep_async(items, source, target, concurrency)
+    else:
+        # For Azure, we can reuse batch endpoint
+        return await _translate_batches_azure_async(items, source, target, batch_size=min(25, max(1, concurrency*2)), concurrency=concurrency)
 
 
 # ===============================================================
@@ -250,10 +364,20 @@ with st.sidebar:
         default=DEFAULT_KEYWORD_BACK_TRANSLATE,
         format_func=lambda k: LANGUAGES[k]
     )
+
     st.markdown("---")
-    kw_method = st.radio("Keyword method", ["RAKE", "YAKE"], index=0)
+    st.subheader("Performance controls")
+    chunk_size = st.slider("Chunk size (chars)", min_value=300, max_value=4000, value=1000, step=100,
+                           help="Text split size before translation.")
+    batch_size = st.slider("Batch size (Azure)", min_value=1, max_value=50, value=25, step=1,
+                           help="How many chunks per Azure request.")
+    concurrency = st.slider("Concurrency", min_value=1, max_value=32, value=8, step=1,
+                            help="Parallel requests/threads.")
+
+    st.markdown("---")
+    kw_method = st.radio("Keyword method", ["RAKE", "YAKE"], index=1)
     kw_count = st.slider("Max keywords", min_value=5, max_value=100, value=30, step=5)
-    st.caption("Tip: For very long transcripts, consider chunking upstream.")
+    st.caption("Tip: For very long transcripts, increase chunk size and concurrency within API limits.")
 
 # Initialize session state
 for key, default in [
@@ -319,28 +443,29 @@ with upload_tab:
             st.download_button("Download XLSX", data=text_to_xlsx_bytes(orig), file_name="original.xlsx")
 
 # -----------------------------
-# 2) Translation
+# 2) Translation (FAST)
 # -----------------------------
 with translation_tab:
-    st.subheader("Translate transcript")
+    st.subheader("Translate transcript (chunked, batched, async)")
 
     if not st.session_state[S_ORIGINAL_TEXT]:
         st.warning("Please upload or paste a transcript in the Upload tab.")
     else:
-        def do_translate(text: str, from_lang: str, to_lang: str) -> str:
-            if backend.startswith("Google"):
-                return translate_text_deep_translator(text, from_lang, to_lang)
-            else:
-                return translate_text_azure(text, from_lang, to_lang)
-
-        if st.button("Translate to Pivot Language"):
-            with st.spinner("Translating…"):
-                try:
-                    translated = do_translate(st.session_state[S_ORIGINAL_TEXT], src_lang, pivot_lang)
-                    st.session_state[S_TRANSLATED_TEXT] = translated
-                    st.success(f"Translated to {LANGUAGES.get(pivot_lang, pivot_lang)}")
-                except Exception as e:
-                    st.error(f"Translation failed: {e}")
+        if st.button("Fast Translate to Pivot Language"):
+            try:
+                st.session_state[S_TRANSLATED_TEXT] = translate_large_text(
+                    text=st.session_state[S_ORIGINAL_TEXT],
+                    source=src_lang,
+                    target=pivot_lang,
+                    backend=backend,
+                    max_chars=chunk_size,
+                    batch_size=batch_size,
+                    concurrency=concurrency,
+                    progress=st
+                )
+                st.success(f"Translated to {LANGUAGES.get(pivot_lang, pivot_lang)}")
+            except Exception as e:
+                st.error(f"Translation failed: {e}")
 
         if st.session_state[S_TRANSLATED_TEXT]:
             st.text_area("Translation (read-only)", value=st.session_state[S_TRANSLATED_TEXT][:20000], height=250, disabled=True)
@@ -394,19 +519,16 @@ with keywords_tab:
                 st.download_button("Download XLSX", data=to_xlsx_bytes(st.session_state[S_PIVOT_KEYWORDS], header="keyword"), file_name="keywords_pivot.xlsx")
 
             st.markdown("---")
-            st.subheader("Translate keywords to selected languages")
+            st.subheader("Translate keywords to selected languages (parallel)")
             if st.button("Translate Keywords"):
                 try:
-                    translated_map: Dict[str, List[str]] = {}
-                    for lang in out_langs:
-                        out_words: List[str] = []
-                        for kw in st.session_state[S_PIVOT_KEYWORDS]:
-                            if backend.startswith("Google"):
-                                out_words.append(translate_text_deep_translator(kw, pivot_lang, lang))
-                            else:
-                                out_words.append(translate_text_azure(kw, pivot_lang, lang))
-                        translated_map[lang] = out_words
-                    st.session_state[S_TRANSLATED_KEYWORDS] = translated_map
+                    async def run_kw():
+                        translated_map: Dict[str, List[str]] = {}
+                        for lang in out_langs:
+                            out_words = await translate_list_async(st.session_state[S_PIVOT_KEYWORDS], pivot_lang, lang, backend, concurrency=max(2, concurrency//2))
+                            translated_map[lang] = out_words
+                        return translated_map
+                    st.session_state[S_TRANSLATED_KEYWORDS] = asyncio.run(run_kw())
                     st.success("Keywords translated.")
                 except Exception as e:
                     st.error(f"Keyword translation failed: {e}")
@@ -457,6 +579,5 @@ with export_tab:
 
 st.markdown("---")
 st.caption(
-    "Production tips: Prefer Azure Translator for quota/SLAs; use Streamlit secrets for keys; add retry/backoff "
-    "and telemetry (e.g., Azure App Insights) as needed."
+    "This build uses chunked + batched + async translation with progress bars. Adjust performance controls in the sidebar for your quotas and network."
 )
