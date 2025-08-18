@@ -1,428 +1,500 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+Streamlit app: Multilingual transcript → translate → keyword extraction → re-translate keywords → export.
+- Multi-step UI with tabs: Upload • Translation • Keywords • Export
+- Accepts TXT / CSV / XLSX uploads
+- Lets you choose source language (or auto) and the "pivot" language for keyword extraction (default English)
+- Lets you select one or more languages to translate keywords into
+- Exports at every step as TXT / CSV / XLSX
+- Pluggable translation backends: deep-translator (Google) or Azure Translator (REST API)
+
+Environment (optional for Azure backend):
+  AZURE_TRANSLATOR_KEY, AZURE_TRANSLATOR_REGION, AZURE_TRANSLATOR_ENDPOINT(optional)
+
+Run:  streamlit run app.py
+"""
+from __future__ import annotations
+import os
+import io
+import time
+from typing import List, Dict, Optional, Tuple
+
 import streamlit as st
 import pandas as pd
-import numpy as np
-from googletrans import Translator
-import io
-import re
-from collections import Counter
-import nltk
-from nltk.corpus import stopwords
-from nltk.tokenize import word_tokenize
-import openpyxl
-from datetime import datetime
-import base64
 
+# Keyword extraction
+try:
+    import nltk
+    from rake_nltk import Rake
+    NLTK_OK = True
+except Exception:
+    NLTK_OK = False
 
-class TranscriptProcessor:
-    def __init__(self):
-        self.translator = Translator()
-        self.supported_languages = {
-            'Japanese': 'ja',
-            'English': 'en',
-            'Korean': 'ko',
-            'Chinese (Simplified)': 'zh',
-            'Spanish': 'es',
-            'French': 'fr',
-            'German': 'de',
-            'Italian': 'it',
-            'Portuguese': 'pt',
-            'Russian': 'ru',
-            'Arabic': 'ar',
-            'Hindi': 'hi',
-            'Thai': 'th',
-            'Vietnamese': 'vi'
-        }
-        
-    def detect_language(self, text):
-        """Detect the language of the input text"""
+try:
+    import yake
+    YAKE_OK = True
+except Exception:
+    YAKE_OK = False
+
+import requests
+
+# -----------------------------
+# Constants & Helpers
+# -----------------------------
+APP_TITLE = "Multilingual Transcript Translator & Keyword Pipeline"
+
+# ISO639-1 common map (subset; add more as needed)
+LANGUAGES = {
+    "auto": "Auto Detect",
+    "en": "English",
+    "ja": "Japanese",
+    "hi": "Hindi",
+    "zh-CN": "Chinese (Simplified)",
+    "zh-TW": "Chinese (Traditional)",
+    "ko": "Korean",
+    "fr": "French",
+    "de": "German",
+    "es": "Spanish",
+    "it": "Italian",
+    "pt": "Portuguese",
+    "ru": "Russian",
+    "ar": "Arabic",
+    "th": "Thai",
+    "id": "Indonesian",
+    "vi": "Vietnamese",
+}
+
+DEFAULT_PIVOT_LANG = "en"  # language used for keyword extraction
+DEFAULT_SOURCE_LANG = "ja"
+DEFAULT_KEYWORD_BACK_TRANSLATE = ["ja"]
+
+TRANSLATION_BACKENDS = ["Google (deep-translator)", "Azure Translator"]
+
+# Session Keys
+S_ORIGINAL_TEXT = "original_text"
+S_TRANSLATED_TEXT = "translated_text"
+S_ENGLISH_KEYWORDS = "english_keywords"
+S_TRANSLATED_KEYWORDS = "translated_keywords"  # dict lang->list
+S_UPLOAD_META = "upload_meta"
+
+# -----------------------------
+# Utilities
+# -----------------------------
+
+def ensure_nltk_resources():
+    if NLTK_OK:
         try:
-            detection = self.translator.detect(text)
-            return detection.lang
-        except Exception as e:
-            st.error(f"Language detection failed: {str(e)}")
-            return None
-    
-    def translate_text(self, text, src_lang, dest_lang='en'):
-        """Translate text from source language to destination language"""
-        try:
-            if src_lang == dest_lang:
-                return text
-            result = self.translator.translate(text, src=src_lang, dest=dest_lang)
-            return result.text
-        except Exception as e:
-            st.error(f"Translation failed: {str(e)}")
-            return text
-    
-    def extract_keywords(self, text, num_keywords=20):
-        """Extract keywords from English text"""
-        try:
-            # Get English stopwords
-            stop_words = set(stopwords.words('english'))
-            
-            # Tokenize and clean text
-            tokens = word_tokenize(text.lower())
-            
-            # Filter out non-alphabetic tokens and stopwords
-            keywords = [word for word in tokens if word.isalpha() and word not in stop_words and len(word) > 2]
-            
-            # Count frequency and get top keywords
-            keyword_freq = Counter(keywords)
-            top_keywords = [word for word, _ in keyword_freq.most_common(num_keywords)]
-            
-            return top_keywords, keyword_freq
-        except Exception as e:
-            st.error(f"Keyword extraction failed: {str(e)}")
-            return [], {}
+            nltk.data.find('tokenizers/punkt')
+        except LookupError:
+            nltk.download('punkt')
 
-def load_file(uploaded_file):
-    """Load and parse uploaded file"""
-    try:
-        if uploaded_file.name.endswith('.csv'):
-            df = pd.read_csv(uploaded_file)
-        elif uploaded_file.name.endswith(('.xlsx', '.xls')):
-            df = pd.read_excel(uploaded_file)
-        elif uploaded_file.name.endswith('.txt'):
-            content = str(uploaded_file.read(), "utf-8")
-            df = pd.DataFrame({'text': [content]})
-        else:
-            st.error("Unsupported file format. Please upload CSV, Excel, or TXT files.")
-            return None
-        return df
-    except Exception as e:
-        st.error(f"Error loading file: {str(e)}")
-        return None
 
-def create_download_link(df, filename, file_format):
-    """Create a download link for the dataframe"""
-    if file_format == 'CSV':
-        csv = df.to_csv(index=False)
-        b64 = base64.b64encode(csv.encode()).decode()
-        href = f'<a href="data:file/csv;base64,{b64}" download="{filename}.csv">Download {filename}.csv</a>'
-    elif file_format == 'Excel':
-        output = io.BytesIO()
-        with pd.ExcelWriter(output, engine='openpyxl') as writer:
-            df.to_excel(writer, index=False)
-        excel_data = output.getvalue()
-        b64 = base64.b64encode(excel_data).decode()
-        href = f'<a href="data:application/vnd.openxmlformats-officedocument.spreadsheetml.sheet;base64,{b64}" download="{filename}.xlsx">Download {filename}.xlsx</a>'
-    elif file_format == 'Text':
-        if len(df.columns) == 1:
-            text = '\n'.join(df.iloc[:, 0].astype(str))
-        else:
-            text = df.to_string(index=False)
-        b64 = base64.b64encode(text.encode()).decode()
-        href = f'<a href="data:text/plain;base64,{b64}" download="{filename}.txt">Download {filename}.txt</a>'
-    
-    return href
-
-def main():
-    st.set_page_config(
-        page_title="Multi-Language Transcript Processor",
-        page_icon="🌐",
-        layout="wide"
-    )
-    
-    st.title("🌐 Multi-Language Transcript Processor")
-    st.markdown("### Professional-grade transcript translation and keyword extraction tool")
-    
-    # Initialize processor
-    processor = TranscriptProcessor()
-    
-    # Sidebar for settings
-    st.sidebar.header("Settings")
-    workflow_type = st.sidebar.selectbox(
-        "Workflow Type",
-        ["Multi-Step Tabs", "Single Page Workflow"]
-    )
-    
-    # Language selection
-    source_language = st.sidebar.selectbox(
-        "Source Language",
-        list(processor.supported_languages.keys()),
-        index=0
-    )
-    
-    target_language_back = st.sidebar.selectbox(
-        "Target Language for Keywords (back-translation)",
-        list(processor.supported_languages.keys()),
-        index=0
-    )
-    
-    num_keywords = st.sidebar.slider("Number of Keywords to Extract", 5, 50, 20)
-    
-    # Initialize session state
-    if 'original_data' not in st.session_state:
-        st.session_state.original_data = None
-    if 'translated_data' not in st.session_state:
-        st.session_state.translated_data = None
-    if 'keywords_data' not in st.session_state:
-        st.session_state.keywords_data = None
-    if 'translated_keywords_data' not in st.session_state:
-        st.session_state.translated_keywords_data = None
-    
-    if workflow_type == "Multi-Step Tabs":
-        # Multi-step tab workflow
-        tab1, tab2, tab3, tab4 = st.tabs(["📁 Upload", "🔄 Translation", "🔑 Keywords", "📤 Export"])
-        
-        with tab1:
-            st.header("Step 1: Upload Your Data")
-            uploaded_file = st.file_uploader(
-                "Choose a file",
-                type=['csv', 'xlsx', 'xls', 'txt'],
-                help="Upload CSV, Excel, or Text files containing transcripts"
-            )
-            
-            if uploaded_file:
-                df = load_file(uploaded_file)
-                if df is not None:
-                    st.session_state.original_data = df
-                    st.success("File uploaded successfully!")
-                    st.dataframe(df.head())
-                    
-                    # Download original data
-                    st.subheader("Download Original Data")
-                    col1, col2, col3 = st.columns(3)
-                    with col1:
-                        if st.button("Download as CSV"):
-                            st.markdown(create_download_link(df, "original_data", "CSV"), unsafe_allow_html=True)
-                    with col2:
-                        if st.button("Download as Excel"):
-                            st.markdown(create_download_link(df, "original_data", "Excel"), unsafe_allow_html=True)
-                    with col3:
-                        if st.button("Download as Text"):
-                            st.markdown(create_download_link(df, "original_data", "Text"), unsafe_allow_html=True)
-        
-        with tab2:
-            st.header("Step 2: Translation")
-            if st.session_state.original_data is not None:
-                df = st.session_state.original_data.copy()
-                
-                # Select text column
-                text_columns = df.select_dtypes(include=['object']).columns.tolist()
-                if text_columns:
-                    text_column = st.selectbox("Select text column to translate", text_columns)
-                    
-                    if st.button("🔄 Start Translation", type="primary"):
-                        progress_bar = st.progress(0)
-                        translated_texts = []
-                        
-                        src_lang_code = processor.supported_languages[source_language]
-                        
-                        for i, text in enumerate(df[text_column]):
-                            if pd.notna(text):
-                                translated_text = processor.translate_text(str(text), src_lang_code, 'en')
-                                translated_texts.append(translated_text)
-                            else:
-                                translated_texts.append("")
-                            
-                            progress_bar.progress((i + 1) / len(df))
-                        
-                        df['translated_text'] = translated_texts
-                        st.session_state.translated_data = df
-                        st.success("Translation completed!")
-                
-                if st.session_state.translated_data is not None:
-                    st.subheader("Translation Results")
-                    st.dataframe(st.session_state.translated_data)
-                    
-                    # Download translated data
-                    st.subheader("Download Translated Data")
-                    col1, col2, col3 = st.columns(3)
-                    with col1:
-                        if st.button("Download CSV (Translation)", key="trans_csv"):
-                            st.markdown(create_download_link(st.session_state.translated_data, "translated_data", "CSV"), unsafe_allow_html=True)
-                    with col2:
-                        if st.button("Download Excel (Translation)", key="trans_excel"):
-                            st.markdown(create_download_link(st.session_state.translated_data, "translated_data", "Excel"), unsafe_allow_html=True)
-                    with col3:
-                        if st.button("Download Text (Translation)", key="trans_text"):
-                            st.markdown(create_download_link(st.session_state.translated_data, "translated_data", "Text"), unsafe_allow_html=True)
-            else:
-                st.warning("Please upload data in the Upload tab first.")
-        
-        with tab3:
-            st.header("Step 3: Keyword Extraction")
-            if st.session_state.translated_data is not None:
-                if st.button("🔑 Extract Keywords", type="primary"):
-                    translated_df = st.session_state.translated_data
-                    all_text = ' '.join(translated_df['translated_text'].dropna().astype(str))
-                    
-                    keywords, keyword_freq = processor.extract_keywords(all_text, num_keywords)
-                    
-                    # Create keywords dataframe
-                    keywords_df = pd.DataFrame({
-                        'keyword': keywords,
-                        'frequency': [keyword_freq[word] for word in keywords]
-                    })
-                    
-                    # Translate keywords back to target language
-                    target_lang_code = processor.supported_languages[target_language_back]
-                    translated_keywords = []
-                    
-                    progress_bar = st.progress(0)
-                    for i, keyword in enumerate(keywords):
-                        translated_keyword = processor.translate_text(keyword, 'en', target_lang_code)
-                        translated_keywords.append(translated_keyword)
-                        progress_bar.progress((i + 1) / len(keywords))
-                    
-                    keywords_df['translated_keyword'] = translated_keywords
-                    st.session_state.keywords_data = keywords_df
-                    st.session_state.translated_keywords_data = keywords_df
-                    
-                    st.success("Keywords extracted and translated!")
-                
-                if st.session_state.keywords_data is not None:
-                    st.subheader("Keywords Results")
-                    st.dataframe(st.session_state.keywords_data)
-                    
-                    # Download keywords data
-                    st.subheader("Download Keywords Data")
-                    col1, col2, col3 = st.columns(3)
-                    with col1:
-                        if st.button("Download CSV (Keywords)", key="kw_csv"):
-                            st.markdown(create_download_link(st.session_state.keywords_data, "keywords_data", "CSV"), unsafe_allow_html=True)
-                    with col2:
-                        if st.button("Download Excel (Keywords)", key="kw_excel"):
-                            st.markdown(create_download_link(st.session_state.keywords_data, "keywords_data", "Excel"), unsafe_allow_html=True)
-                    with col3:
-                        if st.button("Download Text (Keywords)", key="kw_text"):
-                            st.markdown(create_download_link(st.session_state.keywords_data, "keywords_data", "Text"), unsafe_allow_html=True)
-            else:
-                st.warning("Please complete translation in the Translation tab first.")
-        
-        with tab4:
-            st.header("Step 4: Export All Results")
-            if st.session_state.translated_keywords_data is not None:
-                st.success("All processing steps completed! You can download all results below.")
-                
-                # Create comprehensive export
-                export_data = {
-                    'Original Data': st.session_state.original_data,
-                    'Translated Data': st.session_state.translated_data,
-                    'Keywords Data': st.session_state.keywords_data
-                }
-                
-                for name, data in export_data.items():
-                    if data is not None:
-                        st.subheader(f"{name}")
-                        col1, col2, col3 = st.columns(3)
-                        with col1:
-                            if st.button(f"CSV", key=f"export_csv_{name}"):
-                                st.markdown(create_download_link(data, name.lower().replace(' ', '_'), "CSV"), unsafe_allow_html=True)
-                        with col2:
-                            if st.button(f"Excel", key=f"export_excel_{name}"):
-                                st.markdown(create_download_link(data, name.lower().replace(' ', '_'), "Excel"), unsafe_allow_html=True)
-                        with col3:
-                            if st.button(f"Text", key=f"export_text_{name}"):
-                                st.markdown(create_download_link(data, name.lower().replace(' ', '_'), "Text"), unsafe_allow_html=True)
-            else:
-                st.warning("Please complete all previous steps to export results.")
-    
+def read_uploaded_file(file) -> Tuple[str, Dict]:
+    """Return concatenated text and metadata dict: {type, columns(optional)}"""
+    name = file.name.lower()
+    meta = {"filename": file.name}
+    if name.endswith(".txt"):
+        text = file.read().decode("utf-8", errors="ignore")
+        meta.update({"type": "txt"})
+        return text, meta
+    elif name.endswith(".csv"):
+        df = pd.read_csv(file)
+        meta.update({"type": "csv", "columns": df.columns.tolist(), "df": df})
+        # do not join yet; let user pick a column in UI
+        return "", meta
+    elif name.endswith(".xlsx") or name.endswith(".xls"):
+        df = pd.read_excel(file)
+        meta.update({"type": "excel", "columns": df.columns.tolist(), "df": df})
+        return "", meta
     else:
-        # Single page workflow
-        st.header("Single Page Workflow")
-        
-        # File upload
-        st.subheader("📁 Step 1: Upload Data")
-        uploaded_file = st.file_uploader(
-            "Choose a file",
-            type=['csv', 'xlsx', 'xls', 'txt'],
-            help="Upload CSV, Excel, or Text files containing transcripts"
-        )
-        
-        if uploaded_file:
-            df = load_file(uploaded_file)
-            if df is not None:
-                st.success("File uploaded successfully!")
-                st.dataframe(df.head())
-                
-                # Original data download
-                with st.expander("Download Original Data"):
-                    col1, col2, col3 = st.columns(3)
-                    with col1:
-                        if st.button("CSV (Original)", key="single_orig_csv"):
-                            st.markdown(create_download_link(df, "original_data", "CSV"), unsafe_allow_html=True)
-                    with col2:
-                        if st.button("Excel (Original)", key="single_orig_excel"):
-                            st.markdown(create_download_link(df, "original_data", "Excel"), unsafe_allow_html=True)
-                    with col3:
-                        if st.button("Text (Original)", key="single_orig_text"):
-                            st.markdown(create_download_link(df, "original_data", "Text"), unsafe_allow_html=True)
-                
-                # Translation
-                st.subheader("🔄 Step 2: Translation")
-                text_columns = df.select_dtypes(include=['object']).columns.tolist()
-                if text_columns:
-                    text_column = st.selectbox("Select text column to translate", text_columns)
-                    
-                    if st.button("🔄 Translate Text", type="primary"):
-                        progress_bar = st.progress(0)
-                        translated_texts = []
-                        src_lang_code = processor.supported_languages[source_language]
-                        
-                        for i, text in enumerate(df[text_column]):
-                            if pd.notna(text):
-                                translated_text = processor.translate_text(str(text), src_lang_code, 'en')
-                                translated_texts.append(translated_text)
-                            else:
-                                translated_texts.append("")
-                            progress_bar.progress((i + 1) / len(df))
-                        
-                        df['translated_text'] = translated_texts
-                        st.success("Translation completed!")
-                        st.dataframe(df[['translated_text']].head())
-                        
-                        # Translation download
-                        with st.expander("Download Translated Data"):
-                            col1, col2, col3 = st.columns(3)
-                            with col1:
-                                if st.button("CSV (Translated)", key="single_trans_csv"):
-                                    st.markdown(create_download_link(df, "translated_data", "CSV"), unsafe_allow_html=True)
-                            with col2:
-                                if st.button("Excel (Translated)", key="single_trans_excel"):
-                                    st.markdown(create_download_link(df, "translated_data", "Excel"), unsafe_allow_html=True)
-                            with col3:
-                                if st.button("Text (Translated)", key="single_trans_text"):
-                                    st.markdown(create_download_link(df, "translated_data", "Text"), unsafe_allow_html=True)
-                        
-                        # Keywords extraction
-                        st.subheader("🔑 Step 3: Keyword Extraction")
-                        if st.button("🔑 Extract and Translate Keywords", type="primary"):
-                            all_text = ' '.join(df['translated_text'].dropna().astype(str))
-                            keywords, keyword_freq = processor.extract_keywords(all_text, num_keywords)
-                            
-                            # Create keywords dataframe
-                            keywords_df = pd.DataFrame({
-                                'keyword': keywords,
-                                'frequency': [keyword_freq[word] for word in keywords]
-                            })
-                            
-                            # Translate keywords back
-                            target_lang_code = processor.supported_languages[target_language_back]
-                            translated_keywords = []
-                            
-                            progress_bar = st.progress(0)
-                            for i, keyword in enumerate(keywords):
-                                translated_keyword = processor.translate_text(keyword, 'en', target_lang_code)
-                                translated_keywords.append(translated_keyword)
-                                progress_bar.progress((i + 1) / len(keywords))
-                            
-                            keywords_df['translated_keyword'] = translated_keywords
-                            st.success("Keywords extracted and translated!")
-                            st.dataframe(keywords_df)
-                            
-                            # Keywords download
-                            with st.expander("Download Keywords Data"):
-                                col1, col2, col3 = st.columns(3)
-                                with col1:
-                                    if st.button("CSV (Keywords)", key="single_kw_csv"):
-                                        st.markdown(create_download_link(keywords_df, "keywords_data", "CSV"), unsafe_allow_html=True)
-                                with col2:
-                                    if st.button("Excel (Keywords)", key="single_kw_excel"):
-                                        st.markdown(create_download_link(keywords_df, "keywords_data", "Excel"), unsafe_allow_html=True)
-                                with col3:
-                                    if st.button("Text (Keywords)", key="single_kw_text"):
-                                        st.markdown(create_download_link(keywords_df, "keywords_data", "Text"), unsafe_allow_html=True)
+        raise ValueError("Unsupported file type. Please upload TXT, CSV, or Excel.")
 
-if __name__ == "__main__":
-    main()
+
+def concat_text_from_df(df: pd.DataFrame, columns: List[str]) -> str:
+    if not columns:
+        return ""
+    # Convert selected columns to string and concatenate with spaces per row, then join rows
+    rows = df[columns].astype(str).agg(" ".join, axis=1)
+    return "\n".join(rows.tolist())
+
+
+# -----------------------------
+# Translation Backends
+# -----------------------------
+@st.cache_data(show_spinner=False)
+def translate_text_deep_translator(text: str, source: str, target: str) -> str:
+    from deep_translator import GoogleTranslator
+    if source == "auto":
+        source = "auto"
+    translator = GoogleTranslator(source=source, target=target)
+    # deep-translator handles long texts by splitting; but we chunk anyway
+    return _chunked_translate(lambda chunk: translator.translate(chunk), text)
+
+
+@st.cache_data(show_spinner=False)
+def translate_text_azure(text: str, source: str, target: str) -> str:
+    key = os.getenv("AZURE_TRANSLATOR_KEY")
+    region = os.getenv("AZURE_TRANSLATOR_REGION")
+    endpoint = os.getenv("AZURE_TRANSLATOR_ENDPOINT", "https://api.cognitive.microsofttranslator.com")
+    if not key or not region:
+        raise RuntimeError("Azure Translator requires AZURE_TRANSLATOR_KEY and AZURE_TRANSLATOR_REGION env vars.")
+
+    path = "/translate?api-version=3.0"
+    params = f"&to={target}"
+    if source != "auto":
+        params += f"&from={source}"
+    url = endpoint + path + params
+
+    headers = {
+        'Ocp-Apim-Subscription-Key': key,
+        'Ocp-Apim-Subscription-Region': region,
+        'Content-type': 'application/json',
+    }
+
+    def api_call(chunk: str) -> str:
+        body = [{"text": chunk}]
+        resp = requests.post(url, headers=headers, json=body, timeout=60)
+        resp.raise_for_status()
+        data = resp.json()
+        return data[0]["translations"][0]["text"]
+
+    return _chunked_translate(api_call, text)
+
+
+def _chunked_translate(fn, text: str, max_len: int = 4500, overlap: int = 0) -> str:
+    """Split text into safe chunks for APIs and reassemble."""
+    if len(text) <= max_len:
+        return fn(text)
+    parts = []
+    start = 0
+    while start < len(text):
+        end = min(len(text), start + max_len)
+        chunk = text[start:end]
+        parts.append(fn(chunk))
+        start = end - overlap
+        if start < 0:
+            start = end
+    return "".join(parts)
+
+
+# -----------------------------
+# Keyword Extraction
+# -----------------------------
+
+def extract_keywords_rake(text: str, max_phrases: int = 30) -> List[str]:
+    if not NLTK_OK:
+        raise RuntimeError("rake-nltk / nltk not installed. Add 'rake-nltk' and 'nltk' to requirements.")
+    ensure_nltk_resources()
+    r = Rake()  # uses stopwords and punkt
+    r.extract_keywords_from_text(text)
+    phrases = r.get_ranked_phrases()
+    return phrases[:max_phrases]
+
+
+def extract_keywords_yake(text: str, max_phrases: int = 30, language: str = "en") -> List[str]:
+    if not YAKE_OK:
+        raise RuntimeError("yake not installed. Add 'yake' to requirements.")
+    kw_extractor = yake.KeywordExtractor(lan=language[:2], n=3, top=max_phrases)
+    candidates = kw_extractor.extract_keywords(text)
+    # candidates is list of (phrase, score); lower score = better
+    phrases = [p for p, _ in sorted(candidates, key=lambda x: x[1])]
+    return phrases[:max_phrases]
+
+
+# -----------------------------
+# Export helpers
+# -----------------------------
+
+def to_txt_bytes(text: str) -> bytes:
+    return text.encode("utf-8")
+
+
+def list_to_txt_bytes(lines: List[str]) -> bytes:
+    return ("\n".join(lines)).encode("utf-8")
+
+
+def to_csv_bytes(rows: List[str], header: str = "value") -> bytes:
+    df = pd.DataFrame(rows, columns=[header])
+    return df.to_csv(index=False).encode("utf-8")
+
+
+def to_csv_text(text: str) -> bytes:
+    df = pd.DataFrame([{"text": text}])
+    return df.to_csv(index=False).encode("utf-8")
+
+
+def to_xlsx_bytes(rows: List[str], header: str = "value") -> bytes:
+    df = pd.DataFrame(rows, columns=[header])
+    buf = io.BytesIO()
+    with pd.ExcelWriter(buf, engine="xlsxwriter") as writer:
+        df.to_excel(writer, index=False)
+    buf.seek(0)
+    return buf.read()
+
+
+def text_to_xlsx_bytes(text: str) -> bytes:
+    df = pd.DataFrame([{"text": text}])
+    buf = io.BytesIO()
+    with pd.ExcelWriter(buf, engine="xlsxwriter") as writer:
+        df.to_excel(writer, index=False)
+    buf.seek(0)
+    return buf.read()
+
+
+# -----------------------------
+# UI
+# -----------------------------
+st.set_page_config(page_title=APP_TITLE, page_icon="🗣️", layout="wide")
+st.title(APP_TITLE)
+
+with st.sidebar:
+    st.header("Settings")
+    backend = st.selectbox("Translation backend", TRANSLATION_BACKENDS, index=0,
+                           help="Use Azure for production SLAs; requires env vars.")
+
+    src_lang = st.selectbox("Source language", list(LANGUAGES.keys()), index=list(LANGUAGES.keys()).index(DEFAULT_SOURCE_LANG),
+                            format_func=lambda k: LANGUAGES[k])
+    pivot_lang = st.selectbox("Pivot language for keywords", list(LANGUAGES.keys()), index=list(LANGUAGES.keys()).index(DEFAULT_PIVOT_LANG),
+                              format_func=lambda k: LANGUAGES[k])
+
+    out_langs = st.multiselect("Translate keywords into… (one or more)", list(LANGUAGES.keys()),
+                               default=DEFAULT_KEYWORD_BACK_TRANSLATE,
+                               format_func=lambda k: LANGUAGES[k])
+
+    st.markdown("---")
+    kw_method = st.radio("Keyword method", ["RAKE", "YAKE"], index=0,
+                         help="RAKE is simple; YAKE can be sharper.")
+    kw_count = st.slider("Max keywords", min_value=5, max_value=100, value=30, step=5)
+
+    st.caption("Tip: Keep long transcripts under ~200k chars per run, or chunk them upstream.")
+
+# Initialize session state
+for key, default in [
+    (S_ORIGINAL_TEXT, ""),
+    (S_TRANSLATED_TEXT, ""),
+    (S_ENGLISH_KEYWORDS, []),
+    (S_TRANSLATED_KEYWORDS, {}),
+    (S_UPLOAD_META, {}),
+]:
+    if key not in st.session_state:
+        st.session_state[key] = default
+
+
+# Tabs
+upload_tab, translation_tab, keywords_tab, export_tab = st.tabs(["1) Upload", "2) Translation", "3) Keywords", "4) Export"])
+
+
+# -----------------------------
+# 1) Upload
+# -----------------------------
+with upload_tab:
+    st.subheader("Upload transcript (TXT / CSV / Excel)")
+    uploaded = st.file_uploader("Choose a file", type=["txt", "csv", "xlsx", "xls"], accept_multiple_files=False)
+
+    chosen_cols = []
+    if uploaded is not None:
+        try:
+            text, meta = read_uploaded_file(uploaded)
+            st.session_state[S_UPLOAD_META] = meta
+            if meta.get("type") == "txt":
+                st.text_area("Preview (read-only)", value=text, height=200, disabled=True)
+                st.session_state[S_ORIGINAL_TEXT] = text
+            else:
+                df = meta["df"]
+                st.dataframe(df.head(50))
+                st.info("Select which column(s) contain text to process.")
+                chosen_cols = st.multiselect("Columns", meta["columns"], meta["columns"][:1])
+                if st.button("Build transcript from selected columns"):
+                    built = concat_text_from_df(df, chosen_cols)
+                    if not built.strip():
+                        st.warning("No text found in the selected columns.")
+                    else:
+                        st.success(f"Built transcript from {len(chosen_cols)} column(s), {len(built)} characters.")
+                        st.text_area("Preview (read-only)", value=built[:4000], height=200, disabled=True)
+                        st.session_state[S_ORIGINAL_TEXT] = built
+        except Exception as e:
+            st.error(f"Upload error: {e}")
+
+    # Manual paste fallback
+    st.markdown("### Or paste text")
+    pasted = st.text_area("Paste transcript here (optional)", height=150)
+    if pasted:
+        st.session_state[S_ORIGINAL_TEXT] = pasted
+        st.session_state[S_UPLOAD_META] = {"type": "pasted", "filename": "pasted.txt"}
+
+    # Downloads (Original)
+    if st.session_state[S_ORIGINAL_TEXT]:
+        st.markdown("#### Download original (from current session)")
+        orig = st.session_state[S_ORIGINAL_TEXT]
+        col1, col2, col3 = st.columns(3)
+        with col1:
+            st.download_button("Download TXT", data=to_txt_bytes(orig), file_name="original.txt")
+        with col2:
+            st.download_button("Download CSV", data=to_csv_text(orig), file_name="original.csv")
+        with col3:
+            st.download_button("Download XLSX", data=text_to_xlsx_bytes(orig), file_name="original.xlsx")
+
+
+# -----------------------------
+# 2) Translation
+# -----------------------------
+with translation_tab:
+    st.subheader("Translate transcript")
+
+    if not st.session_state[S_ORIGINAL_TEXT]:
+        st.warning("Please upload or paste a transcript in the Upload tab.")
+    else:
+        def do_translate(text, from_lang, to_lang):
+            if backend.startswith("Google"):
+                return translate_text_deep_translator(text, from_lang, to_lang)
+            else:
+                return translate_text_azure(text, from_lang, to_lang)
+
+        if st.button("Translate to Pivot Language"):
+            with st.spinner("Translating…"):
+                try:
+                    translated = do_translate(st.session_state[S_ORIGINAL_TEXT], src_lang, pivot_lang)
+                    st.session_state[S_TRANSLATED_TEXT] = translated
+                    st.success(f"Translated to {LANGUAGES.get(pivot_lang, pivot_lang)}")
+                except Exception as e:
+                    st.error(f"Translation failed: {e}")
+
+        if st.session_state[S_TRANSLATED_TEXT]:
+            st.text_area("Translation (read-only)", value=st.session_state[S_TRANSLATED_TEXT][:20000], height=250, disabled=True)
+
+            # Downloads (Translation)
+            col1, col2, col3 = st.columns(3)
+            with col1:
+                st.download_button("Download TXT", data=to_txt_bytes(st.session_state[S_TRANSLATED_TEXT]), file_name=f"translation_{pivot_lang}.txt")
+            with col2:
+                st.download_button("Download CSV", data=to_csv_text(st.session_state[S_TRANSLATED_TEXT]), file_name=f"translation_{pivot_lang}.csv")
+            with col3:
+                st.download_button("Download XLSX", data=text_to_xlsx_bytes(st.session_state[S_TRANSLATED_TEXT]), file_name=f"translation_{pivot_lang}.xlsx")
+
+
+# -----------------------------
+# 3) Keywords
+# -----------------------------
+with keywords_tab:
+    st.subheader("Extract keywords and translate them")
+
+    if not st.session_state[S_TRANSLATED_TEXT]:
+        st.warning("Please generate a translation in the Translation tab.")
+    else:
+        text_for_kw = st.session_state[S_TRANSLATED_TEXT]
+
+        if st.button("Extract Keywords"):
+            try:
+                if kw_method == "RAKE":
+                    kws = extract_keywords_rake(text_for_kw, kw_count)
+                else:
+                    kws = extract_keywords_yake(text_for_kw, kw_count, language=pivot_lang)
+                # Deduplicate while preserving order
+                seen = set()
+                uniq = []
+                for k in kws:
+                    k2 = k.strip()
+                    if k2 and k2.lower() not in seen:
+                        seen.add(k2.lower())
+                        uniq.append(k2)
+                st.session_state[S_ENGLISH_KEYWORDS] = uniq
+                st.success(f"Extracted {len(uniq)} keyword(s).")
+            except Exception as e:
+                st.error(f"Keyword extraction failed: {e}")
+
+        if st.session_state[S_ENGLISH_KEYWORDS]:
+            st.write(st.session_state[S_ENGLISH_KEYWORDS])
+
+            # Downloads (English keywords)
+            col1, col2, col3 = st.columns(3)
+            with col1:
+                st.download_button("Download TXT", data=list_to_txt_bytes(st.session_state[S_ENGLISH_KEYWORDS]), file_name="keywords_pivot.txt")
+            with col2:
+                st.download_button("Download CSV", data=to_csv_bytes(st.session_state[S_ENGLISH_KEYWORDS], header="keyword"), file_name="keywords_pivot.csv")
+            with col3:
+                st.download_button("Download XLSX", data=to_xlsx_bytes(st.session_state[S_ENGLISH_KEYWORDS], header="keyword"), file_name="keywords_pivot.xlsx")
+
+            st.markdown("---")
+            st.subheader("Translate keywords to selected languages")
+            if st.button("Translate Keywords"):
+                try:
+                    translated_map = {}
+                    for lang in out_langs:
+                        # translate each keyword
+                        out = []
+                        for kw in st.session_state[S_ENGLISH_KEYWORDS]:
+                            if backend.startswith("Google"):
+                                out.append(translate_text_deep_translator(kw, pivot_lang, lang))
+                            else:
+                                out.append(translate_text_azure(kw, pivot_lang, lang))
+                        translated_map[lang] = out
+                    st.session_state[S_TRANSLATED_KEYWORDS] = translated_map
+                    st.success("Keywords translated.")
+                except Exception as e:
+                    st.error(f"Keyword translation failed: {e}")
+
+            # Show & download per language
+            if st.session_state[S_TRANSLATED_KEYWORDS]:
+                for lang, words in st.session_state[S_TRANSLATED_KEYWORDS].items():
+                    with st.expander(f"{LANGUAGES.get(lang, lang)} keywords"):
+                        st.write(words)
+                        c1, c2, c3 = st.columns(3)
+                        with c1:
+                            st.download_button("TXT", data=list_to_txt_bytes(words), file_name=f"keywords_{lang}.txt")
+                        with c2:
+                            st.download_button("CSV", data=to_csv_bytes(words, header="keyword"), file_name=f"keywords_{lang}.csv")
+                        with c3:
+                            st.download_button("XLSX", data=to_xlsx_bytes(words, header="keyword"), file_name=f"keywords_{lang}.xlsx")
+
+
+# -----------------------------
+# 4) Export
+# -----------------------------
+with export_tab:
+    st.subheader("Summary & Bulk Exports")
+    orig = st.session_state[S_ORIGINAL_TEXT]
+    trans = st.session_state[S_TRANSLATED_TEXT]
+    kws = st.session_state[S_ENGLISH_KEYWORDS]
+    trans_kws = st.session_state[S_TRANSLATED_KEYWORDS]
+
+    colA, colB, colC, colD = st.columns(4)
+
+    with colA:
+        st.metric("Original length", f"{len(orig)} chars")
+    with colB:
+        st.metric("Translation length", f"{len(trans)} chars")
+    with colC:
+        st.metric("Pivot keywords", f"{len(kws)}")
+    with colD:
+        st.metric("Languages for keywords", f"{len(trans_kws)}")
+
+    st.markdown("### Download again (quick)")
+    c1, c2, c3 = st.columns(3)
+    with c1:
+        st.download_button("Original.txt", data=to_txt_bytes(orig or ""), file_name="original.txt")
+        st.download_button("Keywords_pivot.txt", data=list_to_txt_bytes(kws or []), file_name="keywords_pivot.txt")
+    with c2:
+        st.download_button("Translation.csv", data=to_csv_text(trans or ""), file_name=f"translation_{pivot_lang}.csv")
+        st.download_button("Keywords_pivot.csv", data=to_csv_bytes(kws or [], header="keyword"), file_name="keywords_pivot.csv")
+    with c3:
+        st.download_button("Translation.xlsx", data=text_to_xlsx_bytes(trans or ""), file_name=f"translation_{pivot_lang}.xlsx")
+        st.download_button("Keywords_pivot.xlsx", data=to_xlsx_bytes(kws or [], header="keyword"), file_name="keywords_pivot.xlsx")
+
+    if trans_kws:
+        st.markdown("### Per-language keyword downloads")
+        for lang, words in trans_kws.items():
+            cc1, cc2, cc3 = st.columns(3)
+            with cc1:
+                st.download_button(f"{lang} .txt", data=list_to_txt_bytes(words), file_name=f"keywords_{lang}.txt")
+            with cc2:
+                st.download_button(f"{lang} .csv", data=to_csv_bytes(words, header="keyword"), file_name=f"keywords_{lang}.csv")
+            with cc3:
+                st.download_button(f"{lang} .xlsx", data=to_xlsx_bytes(words, header="keyword"), file_name=f"keywords_{lang}.xlsx")
+
+
+# Footer
+st.markdown("---")
+st.caption(
+    "This app provides a simple, production-ready pipeline. For enterprise use, prefer Azure Translator backend, "
+    "configure retries and budgets externally, and log usage via Streamlit secrets or Azure App Insights.")
