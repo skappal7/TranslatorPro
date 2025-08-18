@@ -12,13 +12,6 @@ import openpyxl
 from datetime import datetime
 import base64
 
-# Download NLTK data (run this once)
-try:
-    nltk.data.find('tokenizers/punkt')
-    nltk.data.find('corpora/stopwords')
-except LookupError:
-    nltk.download('punkt')
-    nltk.download('stopwords')
 
 class TranscriptProcessor:
     def __init__(self):
