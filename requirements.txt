@@ -8,3 +8,5 @@ nltk>=3.8
 rake-nltk>=1.0.6
 yake>=0.4.8
 tqdm>=4.66
+nltk-stopwords
+nltk-punkt
