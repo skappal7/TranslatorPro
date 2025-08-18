@@ -1,10 +1,3 @@
-try:
-    nltk.data.find('tokenizers/punkt')
-    nltk.data.find('corpora/stopwords')
-except LookupError:
-    nltk.download('punkt')
-    nltk.download('stopwords')
-    
 import streamlit as st
 import pandas as pd
 import numpy as np
@@ -13,7 +6,6 @@ import io
 import re
 from collections import Counter
 import nltk
-nltk.download('punkt')
 from nltk.corpus import stopwords
 from nltk.tokenize import word_tokenize
 import openpyxl
