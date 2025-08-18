@@ -25,6 +25,7 @@ class TranscriptProcessor:
         self.translator = Translator()
         self.supported_languages = {
             'Japanese': 'ja',
+            'English': 'en',
             'Korean': 'ko',
             'Chinese (Simplified)': 'zh',
             'Spanish': 'es',
