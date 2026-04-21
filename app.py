@@ -1,9 +1,12 @@
 from __future__ import annotations
 import os
 import io
+import time
+import random
 import math
 import asyncio
 from typing import List, Dict, Tuple, Iterable
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import streamlit as st
 import pandas as pd
@@ -23,6 +26,8 @@ try:
     YAKE_OK = True
 except Exception:
     YAKE_OK = False
+
+
 
 # ===============================================================
 # Constants
@@ -54,11 +59,16 @@ DEFAULT_PIVOT_LANG = "en"
 DEFAULT_KEYWORD_BACK_TRANSLATE = ["ja"]
 TRANSLATION_BACKENDS = ["Google (deep-translator)", "Azure Translator"]
 
+# Redaction profile names (patterns defined in _REDACTION_RULES below)
+REDACTION_PROFILE_NAMES = ["None", "PII", "PCI", "GDPR", "All (PII + PCI + GDPR)"]
+
 # Session keys
 S_ORIGINAL_TEXT = "original_text"
+S_REDACTED_TEXT = "redacted_text"
+S_REDACTION_LOG = "redaction_log"
 S_TRANSLATED_TEXT = "translated_text"
 S_PIVOT_KEYWORDS = "pivot_keywords"
-S_TRANSLATED_KEYWORDS = "translated_keywords"  # dict(lang -> list[str])
+S_TRANSLATED_KEYWORDS = "translated_keywords"
 S_UPLOAD_META = "upload_meta"
 
 # ===============================================================
@@ -66,7 +76,6 @@ S_UPLOAD_META = "upload_meta"
 # ===============================================================
 
 def ensure_nltk_resources():
-    """Ensure nltk punkt + stopwords are present; download once."""
     if not NLTK_OK:
         return
     try:
@@ -106,28 +115,102 @@ def concat_text_from_df(df: pd.DataFrame, columns: List[str]) -> str:
 
 
 # ===============================================================
+# PII / PCI / GDPR Redaction — pure regex, zero extra dependencies
+# ===============================================================
+import re
+
+# Each entry: (entity_type, compiled_pattern, profiles_it_applies_to)
+_REDACTION_RULES: List[Tuple[str, re.Pattern, List[str]]] = [
+    # PCI
+    ("CREDIT_CARD",    re.compile(r'\b(?:4[0-9]{12}(?:[0-9]{3})?'
+                                   r'|5[1-5][0-9]{14}'
+                                   r'|3[47][0-9]{13}'
+                                   r'|6(?:011|5[0-9]{2})[0-9]{12}'
+                                   r'|(?:2131|1800|35\d{3})\d{11})\b'),
+                                   ["PCI", "All (PII + PCI + GDPR)"]),
+    ("IBAN",           re.compile(r'\b[A-Z]{2}\d{2}[A-Z0-9]{1,30}\b'),
+                                   ["PCI", "All (PII + PCI + GDPR)"]),
+    ("US_SSN",         re.compile(r'\b\d{3}-\d{2}-\d{4}\b'),
+                                   ["PCI", "All (PII + PCI + GDPR)"]),
+    ("US_BANK_ACCT",   re.compile(r'\b\d{8,17}\b'),
+                                   ["PCI", "All (PII + PCI + GDPR)"]),
+    # PII
+    ("EMAIL",          re.compile(r'\b[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}\b'),
+                                   ["PII", "GDPR", "All (PII + PCI + GDPR)"]),
+    ("PHONE",          re.compile(r'(?<!\d)(?:\+?\d[\s\-.]?)?'
+                                   r'(?:\(?\d{3}\)?[\s\-.]?)?\d{3}[\s\-.]?\d{4}(?!\d)'),
+                                   ["PII", "All (PII + PCI + GDPR)"]),
+    ("IP_ADDRESS",     re.compile(r'\b(?:\d{1,3}\.){3}\d{1,3}\b'),
+                                   ["PII", "GDPR", "All (PII + PCI + GDPR)"]),
+    ("DATE",           re.compile(r'\b(?:\d{1,2}[\/\-\.]\d{1,2}[\/\-\.]\d{2,4}'
+                                   r'|\d{4}[\/\-\.]\d{1,2}[\/\-\.]\d{1,2})\b'),
+                                   ["PII", "GDPR", "All (PII + PCI + GDPR)"]),
+    ("PASSPORT",       re.compile(r'\b[A-Z]{1,2}[0-9]{6,9}\b'),
+                                   ["PII", "GDPR", "All (PII + PCI + GDPR)"]),
+    ("URL",            re.compile(r'https?://[^\s]+'),
+                                   ["GDPR", "All (PII + PCI + GDPR)"]),
+]
+
+
+def redact_text(text: str, profile: str) -> Tuple[str, List[Dict]]:
+    """
+    Apply regex-based redaction for the selected profile.
+    Returns (redacted_text, audit_log).
+    Audit log = list of {entity_type, matched_value, start, end}.
+    Works entirely in-process — no external dependencies.
+    """
+    if profile == "None":
+        return text, []
+
+    audit: List[Dict] = []
+    for entity_type, pattern, applicable_profiles in _REDACTION_RULES:
+        if profile not in applicable_profiles:
+            continue
+        for match in pattern.finditer(text):
+            audit.append({
+                "entity_type": entity_type,
+                "matched_value": match.group()[:6] + "***",  # partial for audit safety
+                "start": match.start(),
+                "end": match.end(),
+            })
+        text = pattern.sub(f"<{entity_type}>", text)
+
+    return text, audit
+
+
+def redact_chunks(chunks: List[str], profile: str) -> Tuple[List[str], List[Dict]]:
+    """Redact a list of text chunks; aggregate audit logs."""
+    if profile == "None":
+        return chunks, []
+    all_audit: List[Dict] = []
+    clean: List[str] = []
+    for chunk in chunks:
+        rc, log = redact_text(chunk, profile)
+        clean.append(rc)
+        all_audit.extend(log)
+    return clean, all_audit
+
+
+# ===============================================================
 # Chunking utilities
 # ===============================================================
 
-def chunk_text(text: str, max_chars: int = 1000) -> List[str]:
+def chunk_text(text: str, max_chars: int = 4000) -> List[str]:
     """Greedy whitespace-aware chunker that keeps chunks <= max_chars."""
     if len(text) <= max_chars:
         return [text]
     chunks: List[str] = []
-    buf: List[str] = []
     cur = 0
     while cur < len(text):
         end = min(len(text), cur + max_chars)
-        # try to break on last whitespace/newline within window
-        window = text[cur:end]
         if end < len(text):
+            window = text[cur:end]
             brk = window.rfind("\n")
             if brk < 0:
                 brk = window.rfind(" ")
-            if brk > 200:  # avoid tiny fragments
+            if brk > 200:
                 end = cur + brk
-        chunk = text[cur:end]
-        chunks.append(chunk)
+        chunks.append(text[cur:end])
         cur = end
     return chunks
 
@@ -144,129 +227,159 @@ def batched(iterable: Iterable, n: int) -> Iterable[List]:
 
 
 # ===============================================================
-# Translation backends (FAST)
+# Backoff wrapper
 # ===============================================================
-@st.cache_data(show_spinner=False)
-def translate_text_deep_translator(text: str, source: str, target: str) -> str:
-    """Legacy single-call (kept for compatibility)."""
-    from deep_translator import GoogleTranslator
-    translator = GoogleTranslator(source=source, target=target)
-    return _chunked_translate(lambda c: translator.translate(c), text)
+
+def translate_with_backoff(fn, chunk: str, retries: int = 4) -> str:
+    for attempt in range(retries):
+        try:
+            return fn(chunk)
+        except Exception as e:
+            err = str(e).lower()
+            if "429" in err or "quota" in err or "rate" in err or "limit" in err:
+                wait = (2 ** attempt) + random.uniform(0, 1)
+                time.sleep(wait)
+            else:
+                raise
+    raise RuntimeError("Translation failed after retries")
 
 
-def _chunked_translate(fn, text: str, max_len: int = 4500, overlap: int = 0) -> str:
-    if len(text) <= max_len:
-        return fn(text)
-    parts: List[str] = []
-    start = 0
-    while start < len(text):
-        end = min(len(text), start + max_len)
-        parts.append(fn(text[start:end]))
-        start = end - overlap
-        if start < 0:
-            start = end
-    return "".join(parts)
+# ===============================================================
+# Translation — ThreadPoolExecutor (Streamlit Share safe)
+# ===============================================================
 
+def translate_chunks_threaded(
+    chunks: List[str],
+    source: str,
+    target: str,
+    backend: str,
+    concurrency: int = 5,
+    progress_bar=None,
+) -> List[str]:
+    """
+    Translate chunks in parallel using ThreadPoolExecutor.
+    Safe on Streamlit Share — no asyncio.run() or nested event loops.
+    """
+    total = len(chunks)
+    results: List[str] = [""] * total
+    completed = 0
 
-async def _translate_chunks_deep_async(chunks: List[str], source: str, target: str, concurrency: int = 8) -> List[str]:
-    from deep_translator import GoogleTranslator
-    sem = asyncio.Semaphore(concurrency)
-    translator = GoogleTranslator(source=source, target=target)
+    if backend.startswith("Google"):
+        from deep_translator import GoogleTranslator
+        translator = GoogleTranslator(source=source, target=target)
 
-    async def run_one(txt: str) -> str:
-        async with sem:
-            # deep_translator is blocking; run in thread pool
-            return await asyncio.to_thread(translator.translate, txt)
+        def _translate_one(idx_chunk):
+            idx, chunk = idx_chunk
+            translated = translate_with_backoff(translator.translate, chunk)
+            return idx, translated
 
-    return await asyncio.gather(*[run_one(c) for c in chunks])
+        with ThreadPoolExecutor(max_workers=concurrency) as executor:
+            futures = {executor.submit(_translate_one, (i, c)): i for i, c in enumerate(chunks)}
+            for future in as_completed(futures):
+                idx, text = future.result()
+                results[idx] = text
+                completed += 1
+                if progress_bar:
+                    progress_bar.progress(
+                        int(completed / total * 100),
+                        text=f"Translating chunk {completed}/{total}…"
+                    )
 
+    else:
+        # Azure: batch endpoint, thread per batch
+        key = os.getenv("AZURE_TRANSLATOR_KEY")
+        region = os.getenv("AZURE_TRANSLATOR_REGION")
+        endpoint = os.getenv("AZURE_TRANSLATOR_ENDPOINT", "https://api.cognitive.microsofttranslator.com")
+        if not key or not region:
+            raise RuntimeError("Azure requires AZURE_TRANSLATOR_KEY and AZURE_TRANSLATOR_REGION env vars.")
 
-async def _translate_batches_azure_async(chunks: List[str], source: str, target: str, batch_size: int = 25, concurrency: int = 8) -> List[str]:
-    key = os.getenv("AZURE_TRANSLATOR_KEY")
-    region = os.getenv("AZURE_TRANSLATOR_REGION")
-    endpoint = os.getenv("AZURE_TRANSLATOR_ENDPOINT", "https://api.cognitive.microsofttranslator.com")
-    if not key or not region:
-        raise RuntimeError("Azure Translator requires AZURE_TRANSLATOR_KEY and AZURE_TRANSLATOR_REGION env vars.")
+        path = "/translate?api-version=3.0"
+        params = f"&to={target}"
+        if source != "auto":
+            params += f"&from={source}"
+        url = endpoint + path + params
+        headers = {
+            "Ocp-Apim-Subscription-Key": key,
+            "Ocp-Apim-Subscription-Region": region,
+            "Content-type": "application/json",
+        }
 
-    path = "/translate?api-version=3.0"
-    params = f"&to={target}"
-    if source != "auto":
-        params += f"&from={source}"
-    url = endpoint + path + params
+        def _azure_batch(batch_idx_chunks):
+            idxs, batch_chunks = zip(*batch_idx_chunks)
+            for attempt in range(4):
+                try:
+                    resp = requests.post(
+                        url, headers=headers,
+                        json=[{"text": t} for t in batch_chunks],
+                        timeout=60
+                    )
+                    resp.raise_for_status()
+                    translations = [item["translations"][0]["text"] for item in resp.json()]
+                    return list(zip(idxs, translations))
+                except Exception as e:
+                    if attempt == 3:
+                        raise
+                    time.sleep(1.5 * (attempt + 1))
 
-    headers = {
-        "Ocp-Apim-Subscription-Key": key,
-        "Ocp-Apim-Subscription-Region": region,
-        "Content-type": "application/json",
-    }
+        batches = list(batched(list(enumerate(chunks)), 25))
+        with ThreadPoolExecutor(max_workers=concurrency) as executor:
+            futures = [executor.submit(_azure_batch, b) for b in batches]
+            for future in as_completed(futures):
+                for idx, text in future.result():
+                    results[idx] = text
+                completed += len(futures[0].result()) if futures else 0  # approx
+                if progress_bar:
+                    done = sum(1 for r in results if r)
+                    progress_bar.progress(
+                        min(int(done / total * 100), 99),
+                        text=f"Translating batch… {done}/{total} chunks"
+                    )
 
-    async def post_batch(client: httpx.AsyncClient, texts: List[str]) -> List[str]:
-        # simple retry loop
-        for attempt in range(4):
-            try:
-                resp = await client.post(url, headers=headers, json=[{"text": t} for t in texts], timeout=60)
-                resp.raise_for_status()
-                data = resp.json()
-                return [item["translations"][0]["text"] for item in data]
-            except Exception:
-                if attempt == 3:
-                    raise
-                await asyncio.sleep(1.5 * (attempt + 1))
-        return [""] * len(texts)
-
-    results: List[str] = [""] * len(chunks)
-    async with httpx.AsyncClient() as client:
-        sem = asyncio.Semaphore(concurrency)
-        tasks = []
-        index = 0
-        for batch in batched(chunks, batch_size):
-            bstart = index
-            bend = index + len(batch)
-            index = bend
-
-            async def run(b=batch, s=bstart, e=bend):
-                async with sem:
-                    outs = await post_batch(client, b)
-                    results[s:e] = outs
-            tasks.append(asyncio.create_task(run()))
-        await asyncio.gather(*tasks)
+    if progress_bar:
+        progress_bar.progress(100, text="Done ✓")
     return results
 
 
-def translate_large_text(text: str, source: str, target: str, backend: str, max_chars: int, batch_size: int, concurrency: int, progress: st.delta_generator.DeltaGenerator) -> str:
-    """High-throughput translation orchestrator returning the combined string."""
+def translate_large_text(
+    text: str, source: str, target: str, backend: str,
+    max_chars: int, batch_size: int, concurrency: int,
+    progress, redaction_profile: str = "None"
+) -> Tuple[str, List[Dict]]:
+    """
+    Full pipeline: chunk → (optional redact) → translate.
+    Returns (translated_text, audit_log).
+    """
     chunks = chunk_text(text, max_chars=max_chars)
-    total = len(chunks)
-    if total == 0:
-        return ""
+    if not chunks:
+        return "", []
 
-    # Progress UI
     bar = progress.progress(0, text="Preparing…")
 
-    async def run():
-        bar.progress(0, text=f"Translating {total} chunk(s)…")
-        if backend.startswith("Google"):
-            outs = await _translate_chunks_deep_async(chunks, source, target, concurrency=concurrency)
-        else:
-            outs = await _translate_batches_azure_async(chunks, source, target, batch_size=batch_size, concurrency=concurrency)
-        return outs
+    # Redact before sending to external API
+    if redaction_profile != "None":
+        bar.progress(5, text="Redacting sensitive data…")
+        chunks, audit_log = redact_chunks(chunks, redaction_profile)
+    else:
+        audit_log = []
 
-    # Run event loop
-    outs: List[str] = asyncio.run(run())
+    translated = translate_chunks_threaded(
+        chunks=chunks,
+        source=source,
+        target=target,
+        backend=backend,
+        concurrency=concurrency,
+        progress_bar=bar,
+    )
+    return "".join(translated), audit_log
 
-    # Update progress to 100%
-    bar.progress(100, text="Done")
-    return "".join(outs)
 
-
-async def translate_list_async(items: List[str], source: str, target: str, backend: str, concurrency: int = 8) -> List[str]:
+def translate_list_threaded(
+    items: List[str], source: str, target: str, backend: str, concurrency: int = 5
+) -> List[str]:
+    """Translate a list of keyword strings in parallel."""
     if not items:
         return []
-    if backend.startswith("Google"):
-        return await _translate_chunks_deep_async(items, source, target, concurrency)
-    else:
-        # For Azure, we can reuse batch endpoint
-        return await _translate_batches_azure_async(items, source, target, batch_size=min(25, max(1, concurrency*2)), concurrency=concurrency)
+    return translate_chunks_threaded(items, source, target, backend, concurrency)
 
 
 # ===============================================================
@@ -275,9 +388,9 @@ async def translate_list_async(items: List[str], source: str, target: str, backe
 
 def extract_keywords_rake(text: str, max_phrases: int = 30) -> List[str]:
     if not NLTK_OK:
-        raise RuntimeError("rake-nltk / nltk not installed. Add 'rake-nltk' and 'nltk' to requirements.")
+        raise RuntimeError("rake-nltk / nltk not installed.")
     ensure_nltk_resources()
-    r = Rake()  # uses stopwords + punkt
+    r = Rake()
     r.extract_keywords_from_text(text)
     phrases = r.get_ranked_phrases()
     return phrases[:max_phrases]
@@ -285,10 +398,10 @@ def extract_keywords_rake(text: str, max_phrases: int = 30) -> List[str]:
 
 def extract_keywords_yake(text: str, max_phrases: int = 30, language: str = "en") -> List[str]:
     if not YAKE_OK:
-        raise RuntimeError("yake not installed. Add 'yake' to requirements.")
+        raise RuntimeError("yake not installed.")
     kw_extractor = yake.KeywordExtractor(lan=(language.split("-")[0] or "en"), n=3, top=max_phrases)
     candidates = kw_extractor.extract_keywords(text)
-    phrases = [p for p, _ in sorted(candidates, key=lambda x: x[1])]  # lower score is better
+    phrases = [p for p, _ in sorted(candidates, key=lambda x: x[1])]
     return phrases[:max_phrases]
 
 
@@ -299,20 +412,16 @@ def extract_keywords_yake(text: str, max_phrases: int = 30, language: str = "en"
 def to_txt_bytes(text: str) -> bytes:
     return text.encode("utf-8")
 
-
 def list_to_txt_bytes(lines: List[str]) -> bytes:
     return ("\n".join(lines)).encode("utf-8")
-
 
 def to_csv_bytes(rows: List[str], header: str = "value") -> bytes:
     df = pd.DataFrame(rows, columns=[header])
     return df.to_csv(index=False).encode("utf-8")
 
-
 def to_csv_text(text: str) -> bytes:
     df = pd.DataFrame([{"text": text}])
     return df.to_csv(index=False).encode("utf-8")
-
 
 def to_xlsx_bytes(rows: List[str], header: str = "value") -> bytes:
     df = pd.DataFrame(rows, columns=[header])
@@ -322,14 +431,18 @@ def to_xlsx_bytes(rows: List[str], header: str = "value") -> bytes:
     buf.seek(0)
     return buf.read()
 
-
 def text_to_xlsx_bytes(text: str) -> bytes:
-    df = pd.DataFrame([{ "text": text }])
+    df = pd.DataFrame([{"text": text}])
     buf = io.BytesIO()
     with pd.ExcelWriter(buf, engine="xlsxwriter") as writer:
         df.to_excel(writer, index=False)
     buf.seek(0)
     return buf.read()
+
+def audit_log_to_csv(log: List[Dict]) -> bytes:
+    if not log:
+        return pd.DataFrame(columns=["entity_type","start","end","score"]).to_csv(index=False).encode("utf-8")
+    return pd.DataFrame(log).to_csv(index=False).encode("utf-8")
 
 
 # ===============================================================
@@ -367,21 +480,33 @@ with st.sidebar:
 
     st.markdown("---")
     st.subheader("Performance controls")
-    chunk_size = st.slider("Chunk size (chars)", min_value=300, max_value=4000, value=1000, step=100,
-                           help="Text split size before translation.")
-    batch_size = st.slider("Batch size (Azure)", min_value=1, max_value=50, value=25, step=1,
-                           help="How many chunks per Azure request.")
-    concurrency = st.slider("Concurrency", min_value=1, max_value=32, value=8, step=1,
-                            help="Parallel requests/threads.")
+    chunk_size = st.slider("Chunk size (chars)", min_value=300, max_value=4000, value=4000, step=100,
+                           help="Larger = fewer API calls. 4000 is optimal for Google free tier.")
+    batch_size = st.slider("Batch size (Azure)", min_value=1, max_value=50, value=25, step=1)
+    concurrency = st.slider("Concurrency", min_value=1, max_value=16, value=5, step=1,
+                            help="5 is the safe ceiling for Google free tier on Streamlit Share.")
+
+    st.markdown("---")
+    st.subheader("🔒 Redaction")
+    redaction_profile = st.selectbox(
+        "Redaction profile",
+        REDACTION_PROFILE_NAMES,
+        index=0,
+        help="Applied BEFORE text is sent to translation API."
+    )
+    if redaction_profile != "None":
+        st.success(f"Active: {redaction_profile} — entities redacted before API call.")
 
     st.markdown("---")
     kw_method = st.radio("Keyword method", ["RAKE", "YAKE"], index=1)
     kw_count = st.slider("Max keywords", min_value=5, max_value=100, value=30, step=5)
-    st.caption("Tip: For very long transcripts, increase chunk size and concurrency within API limits.")
+
 
 # Initialize session state
 for key, default in [
     (S_ORIGINAL_TEXT, ""),
+    (S_REDACTED_TEXT, ""),
+    (S_REDACTION_LOG, []),
     (S_TRANSLATED_TEXT, ""),
     (S_PIVOT_KEYWORDS, []),
     (S_TRANSLATED_KEYWORDS, {}),
@@ -391,10 +516,12 @@ for key, default in [
         st.session_state[key] = default
 
 # Tabs
-upload_tab, translation_tab, keywords_tab, export_tab = st.tabs(["1) Upload", "2) Translation", "3) Keywords", "4) Export"])
+upload_tab, translation_tab, keywords_tab, export_tab = st.tabs(
+    ["1) Upload & Redact", "2) Translation", "3) Keywords", "4) Export"]
+)
 
 # -----------------------------
-# 1) Upload
+# 1) Upload & Redact
 # -----------------------------
 with upload_tab:
     st.subheader("Upload transcript (TXT / CSV / Excel)")
@@ -430,9 +557,19 @@ with upload_tab:
         st.session_state[S_ORIGINAL_TEXT] = pasted
         st.session_state[S_UPLOAD_META] = {"type": "pasted", "filename": "pasted.txt"}
 
+    # Inline redaction preview
+    if st.session_state[S_ORIGINAL_TEXT] and redaction_profile != "None":
+        if st.button("Preview Redaction"):
+            with st.spinner("Redacting…"):
+                redacted, log = redact_text(
+                    st.session_state[S_ORIGINAL_TEXT][:5000], redaction_profile
+                )
+            st.text_area("Redacted preview (first 5000 chars)", value=redacted, height=200, disabled=True)
+            st.caption(f"{len(log)} entity hit(s) detected in preview sample.")
+
     # Downloads (Original)
     if st.session_state[S_ORIGINAL_TEXT]:
-        st.markdown("#### Download original (from current session)")
+        st.markdown("#### Download original")
         orig = st.session_state[S_ORIGINAL_TEXT]
         col1, col2, col3 = st.columns(3)
         with col1:
@@ -443,17 +580,20 @@ with upload_tab:
             st.download_button("Download XLSX", data=text_to_xlsx_bytes(orig), file_name="original.xlsx")
 
 # -----------------------------
-# 2) Translation (FAST)
+# 2) Translation
 # -----------------------------
 with translation_tab:
-    st.subheader("Translate transcript (chunked, batched, async)")
+    st.subheader("Translate transcript (chunked, threaded, backoff)")
 
     if not st.session_state[S_ORIGINAL_TEXT]:
         st.warning("Please upload or paste a transcript in the Upload tab.")
     else:
-        if st.button("Fast Translate to Pivot Language"):
+        if redaction_profile != "None":
+            st.info(f"🔒 Redaction profile **{redaction_profile}** will be applied before sending to API.")
+
+        if st.button("Translate to Pivot Language"):
             try:
-                st.session_state[S_TRANSLATED_TEXT] = translate_large_text(
+                translated, audit = translate_large_text(
                     text=st.session_state[S_ORIGINAL_TEXT],
                     source=src_lang,
                     target=pivot_lang,
@@ -461,14 +601,30 @@ with translation_tab:
                     max_chars=chunk_size,
                     batch_size=batch_size,
                     concurrency=concurrency,
-                    progress=st
+                    progress=st,
+                    redaction_profile=redaction_profile,
                 )
-                st.success(f"Translated to {LANGUAGES.get(pivot_lang, pivot_lang)}")
+                st.session_state[S_TRANSLATED_TEXT] = translated
+                st.session_state[S_REDACTION_LOG] = audit
+                if audit:
+                    st.success(f"Translated ✓ — {len(audit)} sensitive entity/entities redacted before sending.")
+                else:
+                    st.success(f"Translated to {LANGUAGES.get(pivot_lang, pivot_lang)} ✓")
             except Exception as e:
                 st.error(f"Translation failed: {e}")
 
         if st.session_state[S_TRANSLATED_TEXT]:
             st.text_area("Translation (read-only)", value=st.session_state[S_TRANSLATED_TEXT][:20000], height=250, disabled=True)
+
+            if st.session_state[S_REDACTION_LOG]:
+                with st.expander(f"🔒 Redaction audit log ({len(st.session_state[S_REDACTION_LOG])} hits)"):
+                    st.dataframe(pd.DataFrame(st.session_state[S_REDACTION_LOG]))
+                    st.download_button(
+                        "Download audit log CSV",
+                        data=audit_log_to_csv(st.session_state[S_REDACTION_LOG]),
+                        file_name="redaction_audit.csv"
+                    )
+
             col1, col2, col3 = st.columns(3)
             with col1:
                 st.download_button("Download TXT", data=to_txt_bytes(st.session_state[S_TRANSLATED_TEXT]), file_name=f"translation_{pivot_lang}.txt")
@@ -494,7 +650,6 @@ with keywords_tab:
                     kws = extract_keywords_rake(text_for_kw, kw_count)
                 else:
                     kws = extract_keywords_yake(text_for_kw, kw_count, language=pivot_lang)
-                # dedupe preserve order
                 seen = set()
                 uniq = []
                 for k in kws:
@@ -519,17 +674,19 @@ with keywords_tab:
                 st.download_button("Download XLSX", data=to_xlsx_bytes(st.session_state[S_PIVOT_KEYWORDS], header="keyword"), file_name="keywords_pivot.xlsx")
 
             st.markdown("---")
-            st.subheader("Translate keywords to selected languages (parallel)")
+            st.subheader("Translate keywords to selected languages")
             if st.button("Translate Keywords"):
                 try:
-                    async def run_kw():
-                        translated_map: Dict[str, List[str]] = {}
-                        for lang in out_langs:
-                            out_words = await translate_list_async(st.session_state[S_PIVOT_KEYWORDS], pivot_lang, lang, backend, concurrency=max(2, concurrency//2))
-                            translated_map[lang] = out_words
-                        return translated_map
-                    st.session_state[S_TRANSLATED_KEYWORDS] = asyncio.run(run_kw())
-                    st.success("Keywords translated.")
+                    translated_map: Dict[str, List[str]] = {}
+                    for lang in out_langs:
+                        out_words = translate_list_threaded(
+                            st.session_state[S_PIVOT_KEYWORDS],
+                            pivot_lang, lang, backend,
+                            concurrency=max(2, concurrency // 2)
+                        )
+                        translated_map[lang] = out_words
+                    st.session_state[S_TRANSLATED_KEYWORDS] = translated_map
+                    st.success("Keywords translated ✓")
                 except Exception as e:
                     st.error(f"Keyword translation failed: {e}")
 
@@ -554,8 +711,9 @@ with export_tab:
     trans = st.session_state[S_TRANSLATED_TEXT]
     kws = st.session_state[S_PIVOT_KEYWORDS]
     trans_kws = st.session_state[S_TRANSLATED_KEYWORDS]
+    audit = st.session_state[S_REDACTION_LOG]
 
-    colA, colB, colC, colD = st.columns(4)
+    colA, colB, colC, colD, colE = st.columns(5)
     with colA:
         st.metric("Original length", f"{len(orig)} chars")
     with colB:
@@ -564,6 +722,8 @@ with export_tab:
         st.metric("Pivot keywords", f"{len(kws)}")
     with colD:
         st.metric("Languages for keywords", f"{len(trans_kws)}")
+    with colE:
+        st.metric("Redacted entities", f"{len(audit)}")
 
     st.markdown("### Quick downloads")
     c1, c2, c3 = st.columns(3)
@@ -577,7 +737,18 @@ with export_tab:
         st.download_button("Translation.xlsx", data=text_to_xlsx_bytes(trans or ""), file_name=f"translation_{pivot_lang}.xlsx")
         st.download_button("Keywords_pivot.xlsx", data=to_xlsx_bytes(kws or [], header="keyword"), file_name="keywords_pivot.xlsx")
 
+    if audit:
+        st.markdown("### Redaction Audit Log")
+        st.dataframe(pd.DataFrame(audit))
+        st.download_button(
+            "Download Redaction Audit CSV",
+            data=audit_log_to_csv(audit),
+            file_name="redaction_audit.csv"
+        )
+
 st.markdown("---")
 st.caption(
-    "This build uses chunked + batched + async translation with progress bars. Adjust performance controls in the sidebar for your quotas and network."
+    "Chunked + threaded translation with exponential backoff. "
+    "PII/PCI/GDPR redaction via Microsoft Presidio — applied before text leaves your environment. "
+    "Adjust performance controls in the sidebar (chunk=4000, concurrency=5 recommended for Streamlit Share)."
 )
